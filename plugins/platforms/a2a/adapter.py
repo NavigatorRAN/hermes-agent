@@ -66,6 +66,134 @@ _MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaus
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
 
 
+class _MessageReplayStore:
+    """Durable idempotency ledger for inbound A2A Message.messageId values.
+
+    A client may retry after the agent has completed work but before the HTTP
+    response arrives. Persisting the task result prevents that retry from
+    dispatching a second agent turn, including after an adapter restart.
+    """
+
+    _UNKNOWN_AFTER_RESTART = (
+        "[prior A2A delivery outcome is unknown after adapter restart; "
+        "the message was not replayed]"
+    )
+    _FINAL_STATES = protocol.TERMINAL_STATES | {protocol.STATE_INPUT_REQUIRED}
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with self._connect() as con:
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS a2a_message_replays (
+                    peer TEXT NOT NULL,
+                    agent_slug TEXT NOT NULL,
+                    tenant TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL UNIQUE,
+                    context_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    reply TEXT NOT NULL,
+                    created_iso TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (peer, agent_slug, tenant, message_id)
+                )
+                """
+            )
+            con.execute(
+                """
+                UPDATE a2a_message_replays
+                SET state = ?, reply = ?, updated_at = ?
+                WHERE state NOT IN (?, ?, ?, ?, ?)
+                """,
+                (
+                    protocol.STATE_FAILED,
+                    self._UNKNOWN_AFTER_RESTART,
+                    time.time(),
+                    protocol.STATE_COMPLETED,
+                    protocol.STATE_FAILED,
+                    protocol.STATE_CANCELED,
+                    protocol.STATE_REJECTED,
+                    protocol.STATE_INPUT_REQUIRED,
+                ),
+            )
+
+    def _connect(self):
+        return sqlite3.connect(self.path, timeout=10)
+
+    @staticmethod
+    def _record(row) -> dict:
+        return {
+            "task_id": row[0],
+            "context_id": row[1],
+            "state": row[2],
+            "reply": row[3],
+            "created_iso": row[4],
+        }
+
+    def claim(
+        self,
+        peer: str,
+        agent_slug: str,
+        tenant: str,
+        message_id: str,
+        task_id: str,
+        context_id: str,
+        created_iso: str,
+    ) -> tuple[bool, dict]:
+        with self._lock, self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                """
+                SELECT task_id, context_id, state, reply, created_iso
+                FROM a2a_message_replays
+                WHERE peer = ? AND agent_slug = ? AND tenant = ? AND message_id = ?
+                """,
+                (peer, agent_slug, tenant, message_id),
+            ).fetchone()
+            if row:
+                return False, self._record(row)
+            con.execute(
+                """
+                INSERT INTO a2a_message_replays
+                  (peer, agent_slug, tenant, message_id, task_id, context_id,
+                   state, reply, created_iso, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+                """,
+                (
+                    peer,
+                    agent_slug,
+                    tenant,
+                    message_id,
+                    task_id,
+                    context_id,
+                    protocol.STATE_SUBMITTED,
+                    created_iso,
+                    time.time(),
+                ),
+            )
+            return True, {
+                "task_id": task_id,
+                "context_id": context_id,
+                "state": protocol.STATE_SUBMITTED,
+                "reply": "",
+                "created_iso": created_iso,
+            }
+
+    def complete_task(self, task_id: str, state: str, reply: str) -> None:
+        with self._lock, self._connect() as con:
+            con.execute(
+                """
+                UPDATE a2a_message_replays
+                SET state = ?, reply = ?, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (state, reply, time.time(), task_id),
+            )
+
+
 def _reply_timeout() -> float:
     """Seconds to wait for the agent to answer an inbound task."""
     try:
@@ -364,6 +492,11 @@ class A2AAdapter(BasePlatformAdapter):
         self.tasks = protocol.TaskStore()
         self._turns = protocol.TurnTracker()
         self._rate_limiter = protocol.RateLimiter()
+        replay_home = _profile_home(self._active_profile) or os.path.expanduser("~/.hermes")
+        self._message_replays = _MessageReplayStore(
+            os.path.join(replay_home, "a2a_message_replays.sqlite3")
+        )
+        self._idempotency_lock = threading.Lock()
 
         # Forwarded profile sessions: map (profile, agent_slug, context_id) -> session_id.
         self._profile_sessions: Dict[tuple[str, str, str], str] = {}
@@ -704,6 +837,53 @@ class A2AAdapter(BasePlatformAdapter):
         text = protocol.extract_text(params)
         context_id = protocol.extract_context_id(params) or protocol.new_context_id()
         task_id = protocol.new_task_id()
+        message = params.get("message") if isinstance(params, dict) else None
+        message_id = str(message.get("messageId") or "") if isinstance(message, dict) else ""
+        agent_slug, tenant = self._scope_for_agent(agent)
+        created_iso = protocol.now_iso()
+
+        if message_id:
+            with self._idempotency_lock:
+                is_new, replay = self._message_replays.claim(
+                    peer,
+                    agent_slug,
+                    tenant,
+                    message_id,
+                    task_id,
+                    context_id,
+                    created_iso,
+                )
+                if is_new:
+                    rec = self.tasks.create(task_id, context_id, peer, agent_slug, tenant)
+                else:
+                    if replay["state"] in _MessageReplayStore._FINAL_STATES:
+                        return protocol.build_task(
+                            replay["task_id"],
+                            replay["context_id"],
+                            replay["state"],
+                            replay["reply"],
+                            created_at=replay["created_iso"],
+                        ), None
+                    watched = self.tasks.watch(replay["task_id"], agent_slug, tenant)
+                    if watched is not None:
+                        return None, {
+                            "task_id": replay["task_id"],
+                            "context_id": replay["context_id"],
+                            "peer": peer,
+                            "future": watched,
+                            "created_iso": replay["created_iso"],
+                            "started": time.time(),
+                            "replay": True,
+                        }
+                    return protocol.build_task(
+                        replay["task_id"],
+                        replay["context_id"],
+                        protocol.STATE_FAILED,
+                        _MessageReplayStore._UNKNOWN_AFTER_RESTART,
+                        created_at=replay["created_iso"],
+                    ), None
+        else:
+            rec = self.tasks.create(task_id, context_id, peer, agent_slug, tenant)
 
         # Anti-loop ping-pong protection
         turn = self._turns.track(context_id)
@@ -711,22 +891,24 @@ class A2AAdapter(BasePlatformAdapter):
             protocol.metrics.anti_loop_triggers += 1
             logger.warning("A2A: anti-loop triggered for context %s (turn %d > %d)",
                            context_id, turn, protocol.max_pingpong_turns())
-            rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
-            self.tasks.complete(task_id, protocol.STATE_REJECTED, "")
-            return protocol.build_task(
-                task_id, context_id, protocol.STATE_REJECTED,
+            message = (
                 f"Anti-loop protection: context {context_id} exceeded "
                 f"{protocol.max_pingpong_turns()} turns. Start a new context or "
-                f"increase A2A_MAX_PINGPONG_TURNS.",
+                f"increase A2A_MAX_PINGPONG_TURNS."
+            )
+            self._complete_task(task_id, protocol.STATE_REJECTED, message)
+            return protocol.build_task(
+                task_id, context_id, protocol.STATE_REJECTED,
+                message,
                 created_at=rec["created_iso"],
             ), None
 
         if not text:
-            rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
-            self.tasks.complete(task_id, protocol.STATE_REJECTED, "")
+            message = "Empty task — nothing to do."
+            self._complete_task(task_id, protocol.STATE_REJECTED, message)
             return protocol.build_task(
                 task_id, context_id, protocol.STATE_REJECTED,
-                "Empty task — nothing to do.", created_at=rec["created_iso"],
+                message, created_at=rec["created_iso"],
             ), None
 
         framed = security.wrap_inbound(peer, text)
@@ -734,12 +916,13 @@ class A2AAdapter(BasePlatformAdapter):
         protocol.persist_message(context_id, "user", text, task_id)
         protocol.metrics.inbound_total += 1
 
-        rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
         self._register_inline_push(task_id, params, agent=agent)
 
         if not agent.get("local", True):
             reply, state = self._forward_to_profile(agent, peer, context_id, framed)
-            self.tasks.complete(task_id, state, reply)
+            reply = self._strip_profile_diagnostics(reply)
+            state, reply = self._normalize_reply(state, reply)
+            self._complete_task(task_id, state, reply)
             protocol.persist_message(context_id, "agent", reply, task_id)
             security.audit("outbound", peer, task_id, reply)
             if state == protocol.STATE_COMPLETED:
@@ -751,11 +934,12 @@ class A2AAdapter(BasePlatformAdapter):
             return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
 
         if self._loop is None or self._message_handler is None:
-            self.tasks.complete(task_id, protocol.STATE_FAILED, "")
+            message = "Agent gateway not ready to accept A2A tasks."
+            self._complete_task(task_id, protocol.STATE_FAILED, message)
             protocol.metrics.tasks_failed += 1
             return protocol.build_task(
                 task_id, context_id, protocol.STATE_FAILED,
-                "Agent gateway not ready to accept A2A tasks.",
+                message,
                 created_at=rec["created_iso"],
             ), None
 
@@ -779,7 +963,7 @@ class A2AAdapter(BasePlatformAdapter):
         except Exception as e:
             self._pop_pending(task_id)
             msg = security.redact_outbound(f"Dispatch failed: {e}")
-            self.tasks.complete(task_id, protocol.STATE_FAILED, msg)
+            self._complete_task(task_id, protocol.STATE_FAILED, msg)
             protocol.metrics.tasks_failed += 1
             return protocol.build_task(
                 task_id, context_id, protocol.STATE_FAILED, msg,
@@ -794,7 +978,12 @@ class A2AAdapter(BasePlatformAdapter):
             "future": fut,
             "created_iso": rec["created_iso"],
             "started": time.time(),
+            "replay": False,
         }
+
+    def _complete_task(self, task_id: str, state: str, reply: str) -> None:
+        self.tasks.complete(task_id, state, reply)
+        self._message_replays.complete_task(task_id, state, reply)
 
     def _profile_state_db(self, profile: str) -> Optional[str]:
         home = _profile_home(profile)
@@ -901,15 +1090,7 @@ class A2AAdapter(BasePlatformAdapter):
         peer = pending["peer"]
         self._pop_pending(task_id)
 
-        reply = security.redact_outbound(reply or "")
-
-        # The agent flags clarification requests with a leading marker; map
-        # them to the A2A input-required state so the peer knows to answer.
-        if state == protocol.STATE_COMPLETED:
-            stripped = reply.lstrip()
-            if stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
-                state = protocol.STATE_INPUT_REQUIRED
-                reply = stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
+        state, reply = self._normalize_reply(state, reply)
 
         protocol.persist_message(context_id, "agent", reply, task_id)
         security.audit("outbound", peer, task_id, reply)
@@ -921,9 +1102,36 @@ class A2AAdapter(BasePlatformAdapter):
         else:
             protocol.metrics.tasks_failed += 1
 
-        self.tasks.complete(task_id, state, reply)
+        self._complete_task(task_id, state, reply)
         self._send_push_notification(task_id, context_id, reply, state)
         return state, reply
+
+    @staticmethod
+    def _normalize_reply(state: str, reply: str) -> tuple[str, str]:
+        """Redact a reply and map the clarification marker for every route."""
+        reply = security.redact_outbound(reply or "")
+        if state == protocol.STATE_COMPLETED:
+            stripped = reply.lstrip()
+            if stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
+                return (
+                    protocol.STATE_INPUT_REQUIRED,
+                    stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip(),
+                )
+        return state, reply
+
+    @staticmethod
+    def _strip_profile_diagnostics(reply: str) -> str:
+        """Remove known Hermes CLI startup diagnostics from forwarded output."""
+        lines = (reply or "").splitlines()
+        while lines:
+            first = lines[0].strip()
+            if first.startswith("Warning: Unknown toolsets:") or first.startswith(
+                "⚠ tirith security scanner"
+            ):
+                lines.pop(0)
+                continue
+            break
+        return "\n".join(lines).strip()
 
     def _await_reply(self, pending: dict, keepalive=None) -> tuple[str, str]:
         """Block until the task's future resolves (or times out).
@@ -954,7 +1162,8 @@ class A2AAdapter(BasePlatformAdapter):
             result = protocol.send_message_response(terminal) if v1_response else terminal
             return protocol.jsonrpc_result(req_id, result)
         state, reply = self._await_reply(pending)
-        state, reply = self._finalize_task(pending, state, reply)
+        if not pending.get("replay"):
+            state, reply = self._finalize_task(pending, state, reply)
         task = protocol.build_task(
             pending["task_id"], pending["context_id"], state, reply,
             created_at=pending["created_iso"],
@@ -1021,7 +1230,8 @@ class A2AAdapter(BasePlatformAdapter):
 
             state, reply = self._await_reply(
                 pending, keepalive=lambda: self._sse_write(handler, ": keepalive\n\n"))
-            state, reply = self._finalize_task(pending, state, reply)
+            if not pending.get("replay"):
+                state, reply = self._finalize_task(pending, state, reply)
             self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
         except (BrokenPipeError, ConnectionResetError):
             logger.debug("A2A: stream client disconnected")
@@ -1111,7 +1321,7 @@ class A2AAdapter(BasePlatformAdapter):
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_TASK_NOT_CANCELABLE,
                 f"task {task_id} already {rec['state']}")
-        self.tasks.complete(task_id, protocol.STATE_CANCELED, "")
+        self._complete_task(task_id, protocol.STATE_CANCELED, "")
         self._turns.reset(rec["context_id"])
         self._resolve_task(task_id, protocol.STATE_CANCELED, "")
         rec = self.tasks.get(task_id, *self._scope_for_agent(agent)) or rec
