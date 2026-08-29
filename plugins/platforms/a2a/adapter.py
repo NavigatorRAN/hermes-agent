@@ -256,6 +256,12 @@ def _safe_context_slug(value: str, max_len: int = 96) -> str:
     return (slug or "ctx")[:max_len]
 
 
+def _get_signal_exact_service():
+    from .signal_exact import SignalExactService
+
+    return SignalExactService()
+
+
 def _method_info(method: str) -> tuple[str, bool]:
     """Return (canonical_operation, is_v1_method).
 
@@ -265,6 +271,8 @@ def _method_info(method: str) -> tuple[str, bool]:
     mapping = {
         "SendMessage": ("send", True),
         "message/send": ("send", False),
+        "SignalSendExact": ("signal_send_exact", True),
+        "signal/sendExact": ("signal_send_exact", False),
         "SendStreamingMessage": ("stream", True),
         "message/stream": ("stream", False),
         "GetTask": ("get", True),
@@ -433,6 +441,9 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         if operation == "send":
             self._json(200, adapter._rpc_message_send(req_id, params, identity, agent=agent, v1_response=is_v1))
             return
+        if operation == "signal_send_exact":
+            self._json(200, adapter._rpc_signal_send_exact(req_id, params))
+            return
         if operation == "stream":
             adapter._rpc_message_stream(self, req_id, params, identity, agent=agent)
             return
@@ -519,6 +530,21 @@ class A2AAdapter(BasePlatformAdapter):
     @property
     def name(self) -> str:
         return "A2A"
+
+    def _rpc_signal_send_exact(self, req_id: Any, params: dict) -> dict:
+        http_url = os.getenv("SIGNAL_HTTP_URL", "").strip()
+        account = os.getenv("SIGNAL_ACCOUNT", "").strip()
+        if not http_url or not account:
+            return protocol.jsonrpc_error(
+                req_id,
+                -32060,
+                "Exact Signal delivery is unavailable: bridge configuration is incomplete",
+            )
+        try:
+            receipt = _get_signal_exact_service().send_exact(params)
+        except Exception as exc:
+            return protocol.jsonrpc_error(req_id, -32060, str(exc))
+        return protocol.jsonrpc_result(req_id, receipt)
 
     @property
     def authorization_is_upstream(self) -> bool:
@@ -756,6 +782,7 @@ class A2AAdapter(BasePlatformAdapter):
         restricts what we advertise; without a registry we fall back to that
         static list.
         """
+        skills: Optional[list[dict]] = None
         try:
             from tools.registry import registry as tool_registry
             names = tool_registry.get_registered_toolset_names()
@@ -767,11 +794,28 @@ class A2AAdapter(BasePlatformAdapter):
                 if allowed is None or n in allowed
             }
             if mapping:
-                return protocol.skills_from_toolsets(mapping)
+                skills = protocol.skills_from_toolsets(mapping)
         except Exception:
             logger.debug("A2A: tool registry unavailable for Agent Card", exc_info=True)
-        configured = (agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets
-        return protocol.skills_from_toolsets(configured or [])
+        if skills is None:
+            configured = (agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets
+            skills = protocol.skills_from_toolsets(configured or [])
+        try:
+            if _get_signal_exact_service().is_available():
+                skills.append({
+                    "id": "signal.sendExact",
+                    "name": "Exact Signal delivery",
+                    "description": "Structured exact-body Signal send with a transport receipt",
+                    "tags": [
+                        "signal_send_exact",
+                        "exact_body",
+                        "idempotency_key",
+                        "delivery_receipt",
+                    ],
+                })
+        except Exception:
+            logger.debug("A2A: exact Signal capability unavailable", exc_info=True)
+        return skills
 
     # ── Pending reply plumbing ────────────────────────────────────────────
 

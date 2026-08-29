@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import pytest
 
 from plugins.platforms.a2a import protocol, security, tools
+from plugins.platforms.a2a.adapter import _method_info
 
 
 def _free_port() -> int:
@@ -33,6 +34,100 @@ def _free_port() -> int:
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+def test_exact_signal_send_has_a_non_conversational_rpc_operation():
+    assert _method_info("SignalSendExact") == ("signal_send_exact", True)
+    assert _method_info("signal/sendExact") == ("signal_send_exact", False)
+
+
+def test_exact_signal_send_fails_closed_without_bridge_configuration(monkeypatch):
+    monkeypatch.delenv("SIGNAL_HTTP_URL", raising=False)
+    monkeypatch.delenv("SIGNAL_ACCOUNT", raising=False)
+    adapter = _bare_adapter()
+    handler = getattr(adapter, "_rpc_signal_send_exact", None)
+
+    assert handler is not None
+    response = handler("req-1", {
+        "recipientAlias": "Trusted test contact",
+        "body": "SYNTHETIC TEST ONLY",
+        "contentSHA256": hashlib.sha256(b"SYNTHETIC TEST ONLY").hexdigest(),
+        "idempotencyKey": "canary-1",
+    })
+
+    assert response["error"]["code"] == -32060
+    assert "unavailable" in response["error"]["message"].lower()
+
+
+def test_exact_signal_send_dispatches_typed_request_without_agent_turn(monkeypatch):
+    monkeypatch.setenv("SIGNAL_HTTP_URL", "http://signal.test:8080")
+    monkeypatch.setenv("SIGNAL_ACCOUNT", "+61000000000")
+    captured = {}
+
+    class _ExactService:
+        def send_exact(self, request):
+            captured.update(request)
+            return {
+                "recipientAlias": request["recipientAlias"],
+                "state": "ACCEPTED",
+                "externalReference": "signal:123456",
+                "deliveredContentSHA256": request["contentSHA256"],
+            }
+
+    import plugins.platforms.a2a.adapter as adapter_module
+    monkeypatch.setattr(
+        adapter_module,
+        "_get_signal_exact_service",
+        lambda: _ExactService(),
+        raising=False,
+    )
+    request = {
+        "recipientAlias": "Trusted test contact",
+        "body": "SYNTHETIC TEST ONLY",
+        "contentSHA256": hashlib.sha256(b"SYNTHETIC TEST ONLY").hexdigest(),
+        "idempotencyKey": "canary-2",
+    }
+
+    response = _bare_adapter()._rpc_signal_send_exact("req-2", request)
+
+    assert response["result"]["externalReference"] == "signal:123456"
+    assert captured == request
+
+
+def test_agent_card_advertises_exact_signal_contract_only_when_available(monkeypatch):
+    import plugins.platforms.a2a.adapter as adapter_module
+
+    class _AvailableExactService:
+        def is_available(self):
+            return True
+
+    monkeypatch.setattr(
+        adapter_module,
+        "_get_signal_exact_service",
+        lambda: _AvailableExactService(),
+    )
+
+    card = _bare_adapter()._build_card("http://127.0.0.1:9900/")
+    skill = next(item for item in card["skills"] if item["id"] == "signal.sendExact")
+
+    assert set(skill["tags"]) == {
+        "signal_send_exact",
+        "exact_body",
+        "idempotency_key",
+        "delivery_receipt",
+    }
+
+    class _UnavailableExactService:
+        def is_available(self):
+            return False
+
+    monkeypatch.setattr(
+        adapter_module,
+        "_get_signal_exact_service",
+        lambda: _UnavailableExactService(),
+    )
+    unavailable_card = _bare_adapter()._build_card("http://127.0.0.1:9900/")
+    assert all(item["id"] != "signal.sendExact" for item in unavailable_card["skills"])
 
 
 # --------------------------------------------------------------------------
