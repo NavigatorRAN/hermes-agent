@@ -1,6 +1,7 @@
 """Tests for tools/send_message_tool.py."""
 
 import asyncio
+import base64
 import json
 import os
 import sys
@@ -1542,9 +1543,11 @@ class _FakeSignalHttp:
     Captures (url, payload) per call.
     """
 
-    def __init__(self, responses):
+    def __init__(self, responses, get_responses=None):
         self.responses = list(responses)
+        self.get_responses = list([200] if get_responses is None else get_responses)
         self.calls = []
+        self.probes = []
 
     def __call__(self, *_a, **_kw):
         return self
@@ -1567,6 +1570,13 @@ class _FakeSignalHttp:
             json=lambda data=item: data,
         )
         return resp
+
+    async def get(self, url):
+        self.probes.append(url)
+        if not self.get_responses:
+            raise AssertionError("Unexpected GET")
+        status_code = self.get_responses.pop(0)
+        return SimpleNamespace(status_code=status_code)
 
 
 def _install_signal_http(monkeypatch, fake):
@@ -1606,6 +1616,82 @@ def _patch_sendmsg_sleep_and_time(monkeypatch, capture: list):
 
 
 class TestSendSignalChunking:
+    def test_auto_detects_rest_bridge_before_standalone_send(self, monkeypatch):
+        monkeypatch.setenv("SIGNAL_API_MODE", "jsonrpc")
+        fake = _FakeSignalHttp(
+            [{"timestamp": "1777000000000"}],
+            get_responses=[404, 204],
+        )
+        _install_signal_http(monkeypatch, fake)
+
+        result = asyncio.run(
+            _send_signal(
+                {
+                    "http_url": "http://localhost:8080",
+                    "account": "+15551234567",
+                },
+                "+15557654321",
+                "exact body",
+            )
+        )
+
+        assert result["success"] is True
+        assert fake.probes == [
+            "http://localhost:8080/api/v1/check",
+            "http://localhost:8080/v1/health",
+        ]
+        assert fake.calls[0]["url"] == "http://localhost:8080/v2/send"
+
+    def test_rest_bridge_text_send_uses_v2_contract(self, monkeypatch):
+        fake = _FakeSignalHttp([{"timestamp": "1777000000000"}])
+        _install_signal_http(monkeypatch, fake)
+
+        result = asyncio.run(
+            _send_signal(
+                {
+                    "http_url": "http://localhost:8080",
+                    "account": "+15551234567",
+                    "api_mode": "rest",
+                },
+                "+15557654321",
+                "exact body",
+            )
+        )
+
+        assert result["success"] is True
+        assert fake.calls == [{
+            "url": "http://localhost:8080/v2/send",
+            "payload": {
+                "number": "+15551234567",
+                "recipients": ["+15557654321"],
+                "message": "exact body",
+            },
+        }]
+
+    def test_rest_bridge_attachment_is_base64_encoded(self, monkeypatch, tmp_path):
+        attachment = tmp_path / "evidence.txt"
+        attachment.write_bytes(b"verified evidence")
+        fake = _FakeSignalHttp([{"timestamp": "1777000000001"}])
+        _install_signal_http(monkeypatch, fake)
+
+        result = asyncio.run(
+            _send_signal(
+                {
+                    "http_url": "http://localhost:8080",
+                    "account": "+15551234567",
+                    "api_mode": "rest",
+                },
+                "+15557654321",
+                "attached",
+                media_files=[(str(attachment), False)],
+            )
+        )
+
+        assert result["success"] is True
+        assert fake.calls[0]["payload"]["base64_attachments"] == [
+            base64.b64encode(b"verified evidence").decode("ascii")
+        ]
+
     def test_text_only_single_rpc(self, monkeypatch):
         fake = _FakeSignalHttp([{"result": {"timestamp": 1}}])
         _install_signal_http(monkeypatch, fake)

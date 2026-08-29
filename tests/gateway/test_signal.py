@@ -1,8 +1,10 @@
 """Tests for Signal messenger platform adapter."""
 import asyncio
 import base64
+import json
 import pytest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, AsyncMock
 from urllib.parse import quote
 
@@ -79,6 +81,18 @@ class TestSignalAdapterInit:
         assert adapter.account == "+15551234567"
         assert "group123" in adapter.group_allow_from
 
+    def test_api_mode_is_config_driven_not_environment_driven(self, monkeypatch):
+        monkeypatch.setenv("SIGNAL_API_MODE", "rest")
+
+        adapter = _make_signal_adapter(monkeypatch)
+
+        assert adapter.configured_api_mode == "auto"
+
+    def test_api_mode_accepts_platform_config(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, api_mode="rest")
+
+        assert adapter.configured_api_mode == "rest"
+
 
 class TestSignalConnectCleanup:
     """Regression coverage for failed connect() cleanup."""
@@ -101,6 +115,318 @@ class TestSignalConnectCleanup:
         mock_release.assert_called_once_with("signal-phone", "+15551234567")
         assert adapter.client is None
         assert adapter._platform_lock_identity is None
+
+
+class TestSignalAPIModeDetection:
+    """Catch a false-green bridge URL when Hermes and the backend differ."""
+
+    @pytest.mark.asyncio
+    async def test_auto_detects_bbernhard_rest_bridge(self, monkeypatch):
+        """A bridge with /v1/health but no native daemon endpoint is REST mode."""
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.client = AsyncMock()
+        adapter.client.get.side_effect = [
+            MagicMock(status_code=404),
+            MagicMock(status_code=204),
+        ]
+
+        mode = await adapter._detect_api_mode()
+
+        assert mode == "rest"
+        assert [call.args[0] for call in adapter.client.get.await_args_list] == [
+            "http://localhost:8080/api/v1/check",
+            "http://localhost:8080/v1/health",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_connect_starts_rest_listener_after_auto_detection(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._rest_ws_listener = AsyncMock()
+        adapter._health_monitor = AsyncMock()
+
+        mock_client = AsyncMock()
+        mock_client.get.side_effect = [
+            MagicMock(status_code=404),
+            MagicMock(status_code=204),
+        ]
+        mock_client.aclose = AsyncMock()
+
+        with patch("gateway.platforms.signal.httpx.AsyncClient", return_value=mock_client), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
+             patch("gateway.status.release_scoped_lock"):
+            result = await adapter.connect()
+            await asyncio.sleep(0)
+            await adapter.disconnect()
+
+        assert result is True
+        assert adapter.api_mode == "rest"
+        adapter._rest_ws_listener.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_rest_health_check_uses_bridge_endpoint(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.api_mode = "rest"
+        adapter.client = AsyncMock()
+        adapter.client.get.return_value = MagicMock(status_code=204)
+
+        healthy = await adapter._is_bridge_healthy()
+
+        assert healthy is True
+        adapter.client.get.assert_awaited_once_with(
+            "http://localhost:8080/v1/health",
+            timeout=10.0,
+        )
+
+
+class TestSignalRESTWebSocket:
+    def test_receive_url_uses_websocket_scheme_and_encoded_account(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, account="+31612345678")
+
+        assert adapter._rest_ws_url() == (
+            "ws://localhost:8080/v1/receive/%2B31612345678"
+        )
+
+    @pytest.mark.asyncio
+    async def test_text_frame_dispatches_real_signal_envelope(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._handle_envelope = AsyncMock()
+        payload = {
+            "account": "+15551234567",
+            "envelope": {
+                "sourceNumber": "+15557654321",
+                "timestamp": 1_777_000_000_000,
+                "dataMessage": {"message": "status please"},
+            },
+        }
+
+        await adapter._handle_rest_ws_message(json.dumps(payload))
+
+        adapter._handle_envelope.assert_awaited_once_with(payload)
+
+    @pytest.mark.asyncio
+    async def test_invalid_frame_is_ignored_without_dispatch(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._handle_envelope = AsyncMock()
+
+        await adapter._handle_rest_ws_message("not-json")
+
+        adapter._handle_envelope.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_listener_connects_to_rest_receive_websocket(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._running = True
+        frame = json.dumps({"account": adapter.account, "envelope": {}})
+        connected = []
+
+        class FakeWebSocket:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def __aiter__(self):
+                async def frames():
+                    yield frame
+                return frames()
+
+        def fake_connect(url, **kwargs):
+            connected.append({"url": url, "kwargs": kwargs})
+            return FakeWebSocket()
+
+        async def stop_after_first(received):
+            assert received == frame
+            adapter._running = False
+
+        adapter._handle_rest_ws_message = AsyncMock(side_effect=stop_after_first)
+        import gateway.platforms.signal as signal_module
+        monkeypatch.setattr(
+            signal_module,
+            "websockets",
+            SimpleNamespace(connect=fake_connect),
+            raising=False,
+        )
+
+        await adapter._rest_ws_listener()
+
+        assert connected == [{
+            "url": "ws://localhost:8080/v1/receive/%2B15551234567",
+            "kwargs": {"ping_interval": 30, "ping_timeout": 60},
+        }]
+        adapter._handle_rest_ws_message.assert_awaited_once_with(frame)
+
+
+class TestSignalRESTRPCCompatibility:
+    @pytest.mark.asyncio
+    async def test_send_maps_to_v2_rest_payload_without_model_rewrite(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.api_mode = "rest"
+        response = MagicMock(status_code=201)
+        response.json.return_value = {"timestamp": "1777000000000"}
+        response.raise_for_status.return_value = None
+        adapter.client = AsyncMock()
+        adapter.client.post.return_value = response
+
+        result = await adapter._rpc(
+            "send",
+            {
+                "account": "+15551234567",
+                "recipient": ["+15557654321"],
+                "message": "AAWWW test only",
+            },
+        )
+
+        assert result == {"timestamp": "1777000000000"}
+        adapter.client.post.assert_awaited_once_with(
+            "http://localhost:8080/v2/send",
+            json={
+                "number": "+15551234567",
+                "recipients": ["+15557654321"],
+                "message": "AAWWW test only",
+            },
+            timeout=30.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_encodes_attachments_for_rest_bridge(self, monkeypatch, tmp_path):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.api_mode = "rest"
+        attachment = tmp_path / "evidence.txt"
+        attachment.write_bytes(b"verified evidence")
+        response = MagicMock(status_code=201)
+        response.json.return_value = {"timestamp": "1777000000001"}
+        response.raise_for_status.return_value = None
+        adapter.client = AsyncMock()
+        adapter.client.post.return_value = response
+
+        await adapter._rpc(
+            "send",
+            {
+                "account": adapter.account,
+                "recipient": ["+15557654321"],
+                "message": "attached",
+                "attachments": [str(attachment)],
+            },
+        )
+
+        payload = adapter.client.post.await_args.kwargs["json"]
+        assert payload["base64_attachments"] == [
+            base64.b64encode(b"verified evidence").decode("ascii")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_start_typing_maps_to_rest_put(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.api_mode = "rest"
+        response = MagicMock(status_code=204)
+        response.raise_for_status.return_value = None
+        adapter.client = AsyncMock()
+        adapter.client.put.return_value = response
+
+        result = await adapter._rpc(
+            "sendTyping",
+            {
+                "account": adapter.account,
+                "recipient": ["+15557654321"],
+            },
+        )
+
+        assert result == {"success": True}
+        adapter.client.put.assert_awaited_once_with(
+            "http://localhost:8080/v1/typing-indicator/%2B15551234567",
+            json={"recipient": "+15557654321"},
+            timeout=30.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_maps_to_rest_delete(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.api_mode = "rest"
+        response = MagicMock(status_code=204)
+        response.raise_for_status.return_value = None
+        adapter.client = AsyncMock()
+        adapter.client.delete.return_value = response
+
+        result = await adapter._rpc(
+            "sendTyping",
+            {
+                "account": adapter.account,
+                "recipient": ["+15557654321"],
+                "stop": True,
+            },
+        )
+
+        assert result == {"success": True}
+        adapter.client.delete.assert_awaited_once_with(
+            "http://localhost:8080/v1/typing-indicator/%2B15551234567",
+            json={"recipient": "+15557654321"},
+            timeout=30.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_reaction_maps_to_rest_contract(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.api_mode = "rest"
+        response = MagicMock(status_code=204)
+        response.raise_for_status.return_value = None
+        adapter.client = AsyncMock()
+        adapter.client.post.return_value = response
+
+        result = await adapter._rpc(
+            "sendReaction",
+            {
+                "account": adapter.account,
+                "recipient": ["+15557654321"],
+                "emoji": "✅",
+                "targetAuthor": "+15557654321",
+                "targetTimestamp": 1_777_000_000_000,
+            },
+        )
+
+        assert result == {"success": True}
+        adapter.client.post.assert_awaited_once_with(
+            "http://localhost:8080/v1/reactions/%2B15551234567",
+            json={
+                "recipient": "+15557654321",
+                "reaction": "✅",
+                "target_author": "+15557654321",
+                "timestamp": 1_777_000_000_000,
+            },
+            timeout=30.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_remove_reaction_maps_to_rest_delete(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.api_mode = "rest"
+        response = MagicMock(status_code=204)
+        response.raise_for_status.return_value = None
+        adapter.client = AsyncMock()
+        adapter.client.delete.return_value = response
+
+        result = await adapter._rpc(
+            "sendReaction",
+            {
+                "account": adapter.account,
+                "recipient": ["+15557654321"],
+                "emoji": "",
+                "targetAuthor": "+15557654321",
+                "targetTimestamp": 1_777_000_000_000,
+                "remove": True,
+            },
+        )
+
+        assert result == {"success": True}
+        adapter.client.delete.assert_awaited_once_with(
+            "http://localhost:8080/v1/reactions/%2B15551234567",
+            json={
+                "recipient": "+15557654321",
+                "target_author": "+15557654321",
+                "timestamp": 1_777_000_000_000,
+            },
+            timeout=30.0,
+        )
 
 
 class TestSignalHelpers:
