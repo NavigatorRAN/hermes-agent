@@ -273,6 +273,8 @@ def _method_info(method: str) -> tuple[str, bool]:
         "message/send": ("send", False),
         "SignalSendExact": ("signal_send_exact", True),
         "signal/sendExact": ("signal_send_exact", False),
+        "SignalListRecipients": ("signal_list_recipients", True),
+        "signal/listRecipients": ("signal_list_recipients", False),
         "SendStreamingMessage": ("stream", True),
         "message/stream": ("stream", False),
         "GetTask": ("get", True),
@@ -444,6 +446,9 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         if operation == "signal_send_exact":
             self._json(200, adapter._rpc_signal_send_exact(req_id, params))
             return
+        if operation == "signal_list_recipients":
+            self._json(200, adapter._rpc_signal_list_recipients(req_id))
+            return
         if operation == "stream":
             adapter._rpc_message_stream(self, req_id, params, identity, agent=agent)
             return
@@ -545,6 +550,21 @@ class A2AAdapter(BasePlatformAdapter):
         except Exception as exc:
             return protocol.jsonrpc_error(req_id, -32060, str(exc))
         return protocol.jsonrpc_result(req_id, receipt)
+
+    def _rpc_signal_list_recipients(self, req_id: Any) -> dict:
+        http_url = os.getenv("SIGNAL_HTTP_URL", "").strip()
+        account = os.getenv("SIGNAL_ACCOUNT", "").strip()
+        if not http_url or not account:
+            return protocol.jsonrpc_error(
+                req_id,
+                -32060,
+                "Signal recipient discovery is unavailable: bridge configuration is incomplete",
+            )
+        try:
+            recipients = _get_signal_exact_service().list_recipients()
+        except Exception as exc:
+            return protocol.jsonrpc_error(req_id, -32060, str(exc))
+        return protocol.jsonrpc_result(req_id, {"recipients": recipients})
 
     @property
     def authorization_is_upstream(self) -> bool:
@@ -811,6 +831,17 @@ class A2AAdapter(BasePlatformAdapter):
                         "exact_body",
                         "idempotency_key",
                         "delivery_receipt",
+                    ],
+                })
+                skills.append({
+                    "id": "signal.listRecipients",
+                    "name": "Signal recipient directory",
+                    "description": "Structured Signal contacts and Notes to Self discovery",
+                    "tags": [
+                        "signal_list_recipients",
+                        "contacts",
+                        "notes_to_self",
+                        "destination_kind",
                     ],
                 })
         except Exception:

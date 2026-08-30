@@ -18,6 +18,44 @@ def _request(body: str = "SYNTHETIC TEST ONLY", key: str = "canary-1") -> dict:
     }
 
 
+def test_recipient_directory_includes_notes_to_self_and_unique_named_contacts(monkeypatch):
+    service = SignalExactService()
+    monkeypatch.setenv("SIGNAL_ACCOUNT", "+61000000000")
+    monkeypatch.setenv("SIGNAL_HTTP_URL", "http://signal.test:8080")
+    monkeypatch.setattr(
+        service,
+        "_fetch_contacts",
+        lambda: [
+            {"name": "Veronika Warren", "number": "+61000004959"},
+            {"profile_name": "Ship Duty Officer", "number": "+61000001234"},
+            {"name": "Duplicate", "number": "+61000001111"},
+            {"name": "Duplicate", "number": "+61000002222"},
+            {"name": "Unregistered"},
+        ],
+        raising=False,
+    )
+
+    assert service.list_recipients() == [
+        {"alias": "Notes to Self", "displayName": "Notes to Self", "kind": "SELF"},
+        {"alias": "Ship Duty Officer", "displayName": "Ship Duty Officer", "kind": "CONTACT"},
+        {"alias": "Veronika Warren", "displayName": "Veronika Warren", "kind": "CONTACT"},
+    ]
+
+
+def test_notes_to_self_resolves_to_the_configured_signal_account(monkeypatch):
+    service = SignalExactService()
+    monkeypatch.setenv("SIGNAL_ACCOUNT", "+61000000000")
+    monkeypatch.setenv("SIGNAL_HTTP_URL", "http://signal.test:8080")
+    monkeypatch.setattr(
+        service,
+        "_fetch_contacts",
+        lambda: pytest.fail("Notes to Self must not require contact lookup"),
+        raising=False,
+    )
+
+    assert service._resolve_contact("Notes to Self") == "+61000000000"
+
+
 def test_same_idempotency_key_replays_receipt_without_second_signal_send(
     monkeypatch, tmp_path
 ):
