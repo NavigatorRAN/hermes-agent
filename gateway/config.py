@@ -1767,6 +1767,8 @@ def load_gateway_config() -> GatewayConfig:
                     for _bridge_key in ("port", "host"):
                         if _bridge_key in platform_cfg and _bridge_key not in platform_cfg.get("extra", {}):
                             bridged[_bridge_key] = platform_cfg[_bridge_key]
+                if plat == Platform.SIGNAL and "api_mode" in platform_cfg:
+                    bridged["api_mode"] = platform_cfg["api_mode"]
                 has_channel_overrides = "channel_overrides" in platform_cfg
                 if has_channel_overrides:
                     raw_overrides = platform_cfg.get("channel_overrides")

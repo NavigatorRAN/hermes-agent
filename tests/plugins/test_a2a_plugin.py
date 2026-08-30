@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import pytest
 
 from plugins.platforms.a2a import protocol, security, tools
+from plugins.platforms.a2a.adapter import _method_info
 
 
 def _free_port() -> int:
@@ -33,6 +34,100 @@ def _free_port() -> int:
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+def test_exact_signal_send_has_a_non_conversational_rpc_operation():
+    assert _method_info("SignalSendExact") == ("signal_send_exact", True)
+    assert _method_info("signal/sendExact") == ("signal_send_exact", False)
+
+
+def test_exact_signal_send_fails_closed_without_bridge_configuration(monkeypatch):
+    monkeypatch.delenv("SIGNAL_HTTP_URL", raising=False)
+    monkeypatch.delenv("SIGNAL_ACCOUNT", raising=False)
+    adapter = _bare_adapter()
+    handler = getattr(adapter, "_rpc_signal_send_exact", None)
+
+    assert handler is not None
+    response = handler("req-1", {
+        "recipientAlias": "Trusted test contact",
+        "body": "SYNTHETIC TEST ONLY",
+        "contentSHA256": hashlib.sha256(b"SYNTHETIC TEST ONLY").hexdigest(),
+        "idempotencyKey": "canary-1",
+    })
+
+    assert response["error"]["code"] == -32060
+    assert "unavailable" in response["error"]["message"].lower()
+
+
+def test_exact_signal_send_dispatches_typed_request_without_agent_turn(monkeypatch):
+    monkeypatch.setenv("SIGNAL_HTTP_URL", "http://signal.test:8080")
+    monkeypatch.setenv("SIGNAL_ACCOUNT", "+61000000000")
+    captured = {}
+
+    class _ExactService:
+        def send_exact(self, request):
+            captured.update(request)
+            return {
+                "recipientAlias": request["recipientAlias"],
+                "state": "ACCEPTED",
+                "externalReference": "signal:123456",
+                "deliveredContentSHA256": request["contentSHA256"],
+            }
+
+    import plugins.platforms.a2a.adapter as adapter_module
+    monkeypatch.setattr(
+        adapter_module,
+        "_get_signal_exact_service",
+        lambda: _ExactService(),
+        raising=False,
+    )
+    request = {
+        "recipientAlias": "Trusted test contact",
+        "body": "SYNTHETIC TEST ONLY",
+        "contentSHA256": hashlib.sha256(b"SYNTHETIC TEST ONLY").hexdigest(),
+        "idempotencyKey": "canary-2",
+    }
+
+    response = _bare_adapter()._rpc_signal_send_exact("req-2", request)
+
+    assert response["result"]["externalReference"] == "signal:123456"
+    assert captured == request
+
+
+def test_agent_card_advertises_exact_signal_contract_only_when_available(monkeypatch):
+    import plugins.platforms.a2a.adapter as adapter_module
+
+    class _AvailableExactService:
+        def is_available(self):
+            return True
+
+    monkeypatch.setattr(
+        adapter_module,
+        "_get_signal_exact_service",
+        lambda: _AvailableExactService(),
+    )
+
+    card = _bare_adapter()._build_card("http://127.0.0.1:9900/")
+    skill = next(item for item in card["skills"] if item["id"] == "signal.sendExact")
+
+    assert set(skill["tags"]) == {
+        "signal_send_exact",
+        "exact_body",
+        "idempotency_key",
+        "delivery_receipt",
+    }
+
+    class _UnavailableExactService:
+        def is_available(self):
+            return False
+
+    monkeypatch.setattr(
+        adapter_module,
+        "_get_signal_exact_service",
+        lambda: _UnavailableExactService(),
+    )
+    unavailable_card = _bare_adapter()._build_card("http://127.0.0.1:9900/")
+    assert all(item["id"] != "signal.sendExact" for item in unavailable_card["skills"])
 
 
 # --------------------------------------------------------------------------
@@ -940,8 +1035,10 @@ def _post_json(url, body, headers=None):
         return json.loads(r.read().decode())
 
 
-def _send_body(text, ctx="", extra_params=None):
+def _send_body(text, ctx="", extra_params=None, message_id=""):
     msg = protocol.text_message(protocol.ROLE_USER, text, context_id=ctx)
+    if message_id:
+        msg["messageId"] = message_id
     params = {"message": msg}
     if extra_params:
         params.update(extra_params)
@@ -950,6 +1047,156 @@ def _send_body(text, ctx="", extra_params=None):
 
 @pytest.mark.integration
 class TestInboundRoundTrip:
+    def test_repeated_message_id_returns_cached_task_without_rerunning_agent(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        calls = []
+
+        def reply_fn(event):
+            calls.append(event.text)
+            return "performed once"
+
+        adapter, base = _make_live_adapter(monkeypatch, reply_fn=reply_fn)
+        body = _send_body(
+            "perform the durable update",
+            ctx="ctx-idempotent",
+            message_id="message-durable-run-1",
+        )
+
+        async def run():
+            assert await adapter.connect() is True
+            first = await asyncio.to_thread(_post_json, base + "/", body)
+            second = await asyncio.to_thread(_post_json, base + "/", body)
+            assert first["result"]["id"] == second["result"]["id"]
+            assert first["result"]["status"]["state"] == second["result"]["status"]["state"]
+            assert protocol.extract_text(first["result"]["artifacts"][0]) == "performed once"
+            assert protocol.extract_text(second["result"]["artifacts"][0]) == "performed once"
+            assert len(calls) == 1
+            await adapter.disconnect()
+
+        asyncio.run(run())
+
+    def test_completed_message_id_replay_survives_adapter_restart(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        calls = []
+        body = _send_body(
+            "write one record",
+            ctx="ctx-restart-idempotent",
+            message_id="message-durable-run-2",
+        )
+
+        def reply_fn(event):
+            calls.append(event.text)
+            return "record written"
+
+        first_adapter, first_base = _make_live_adapter(monkeypatch, reply_fn=reply_fn)
+
+        async def first_run():
+            assert await first_adapter.connect() is True
+            response = await asyncio.to_thread(_post_json, first_base + "/", body)
+            await first_adapter.disconnect()
+            return response
+
+        first = asyncio.run(first_run())
+        second_adapter, second_base = _make_live_adapter(monkeypatch, reply_fn=reply_fn)
+
+        async def second_run():
+            assert await second_adapter.connect() is True
+            response = await asyncio.to_thread(_post_json, second_base + "/", body)
+            await second_adapter.disconnect()
+            return response
+
+        second = asyncio.run(second_run())
+        assert first["result"]["id"] == second["result"]["id"]
+        assert first["result"]["status"]["state"] == second["result"]["status"]["state"]
+        assert protocol.extract_text(second["result"]["artifacts"][0]) == "record written"
+        assert len(calls) == 1
+
+    def test_simultaneous_duplicate_waits_for_original_without_second_dispatch(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        calls = []
+
+        def hold_reply(event):
+            calls.append(event.text)
+            return None
+
+        adapter, base = _make_live_adapter(monkeypatch, reply_fn=hold_reply)
+        body = _send_body(
+            "perform once while both callers wait",
+            ctx="ctx-concurrent-idempotent",
+            message_id="message-durable-run-concurrent",
+        )
+
+        async def run():
+            assert await adapter.connect() is True
+            first_post = asyncio.create_task(asyncio.to_thread(_post_json, base + "/", body))
+            while not calls:
+                await asyncio.sleep(0.01)
+            second_post = asyncio.create_task(asyncio.to_thread(_post_json, base + "/", body))
+            await asyncio.sleep(0.1)
+            assert len(calls) == 1
+            assert not first_post.done()
+            assert not second_post.done()
+
+            await adapter.send(
+                "ctx-concurrent-idempotent",
+                "single committed result",
+                metadata={"notify": True},
+            )
+            first, second = await asyncio.gather(first_post, second_post)
+            assert first["result"]["id"] == second["result"]["id"]
+            assert protocol.extract_text(second["result"]["artifacts"][0]) == "single committed result"
+            assert len(calls) == 1
+            await adapter.disconnect()
+
+        asyncio.run(run())
+
+    def test_incomplete_replay_ledger_fails_closed_after_restart(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        calls = []
+        body = _send_body(
+            "do not dispatch this uncertain retry",
+            ctx="ctx-uncertain-restart",
+            message_id="message-durable-run-uncertain",
+        )
+
+        seeded_adapter, _ = _make_live_adapter(monkeypatch)
+        created, _ = seeded_adapter._message_replays.claim(
+            "ip:127.0.0.1",
+            "",
+            "",
+            "message-durable-run-uncertain",
+            "task-before-restart",
+            "ctx-uncertain-restart",
+            protocol.now_iso(),
+        )
+        assert created is True
+
+        def reply_fn(event):
+            calls.append(event.text)
+            return "must not run"
+
+        recovered, base = _make_live_adapter(monkeypatch, reply_fn=reply_fn)
+
+        async def run():
+            assert await recovered.connect() is True
+            response = await asyncio.to_thread(_post_json, base + "/", body)
+            task = response["result"]
+            assert task["id"] == "task-before-restart"
+            assert task["status"]["state"] == protocol.STATE_FAILED
+            assert "outcome is unknown" in protocol.extract_text(task["status"]["message"])
+            assert calls == []
+            await recovered.disconnect()
+
+        asyncio.run(run())
+
     def test_live_server_card_and_message_send(self, monkeypatch):
         """Start the real adapter server, hit the Agent Card, then send a task
         and verify the mocked agent's reply comes back as a v1.0 Task."""
@@ -1381,6 +1628,37 @@ class TestMultiAgentRouting:
         assert terminal["status"]["state"] == protocol.STATE_COMPLETED
         assert protocol.extract_text(terminal["artifacts"][0]) == "dev reply"
         assert adapter.tasks.get(terminal["id"])["state"] == protocol.STATE_COMPLETED
+
+    def test_forwarded_profile_marker_maps_to_input_required(self, monkeypatch):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"reporting": {"profile": "reporting", "tenant": "reporting"}}
+        }))
+        agent = adapter._agents["reporting"]
+        adapter._forward_to_profile = lambda *_: (
+            "Warning: Unknown toolsets: a2a\n"
+            "[INPUT_REQUIRED] What is the authoritative due date?",
+            protocol.STATE_COMPLETED,
+        )
+
+        terminal, pending = adapter._prepare_task(
+            {
+                "tenant": "reporting",
+                "message": protocol.text_message(
+                    protocol.ROLE_USER, "prepare the dated report", context_id="ctx-reporting"
+                ),
+            },
+            "peer-x",
+            agent=agent,
+        )
+
+        assert pending is None
+        assert terminal["status"]["state"] == protocol.STATE_INPUT_REQUIRED
+        assert "authoritative due date" in protocol.extract_text(terminal["status"]["message"])
+        assert "[INPUT_REQUIRED]" not in protocol.extract_text(terminal["status"]["message"])
+        assert adapter.tasks.get(terminal["id"])["state"] == protocol.STATE_INPUT_REQUIRED
 
 
 class TestClientTenantAndDiscovery:

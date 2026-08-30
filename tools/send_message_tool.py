@@ -6,11 +6,13 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import re
 import time
+from pathlib import Path
 
 
 from agent.redact import redact_sensitive_text
@@ -1794,8 +1796,30 @@ async def _send_signal(extra, chat_id, message, media_files=None):
     try:
         http_url = extra.get("http_url", "http://127.0.0.1:8080").rstrip("/")
         account = extra.get("account", "")
+        api_mode = str(extra.get("api_mode") or "auto").strip().lower()
         if not account:
             return {"error": "Signal account not configured"}
+        if api_mode not in {"auto", "jsonrpc", "rest"}:
+            return {"error": f"Unsupported Signal api_mode: {api_mode}"}
+        if api_mode == "auto":
+            probes = (
+                ("jsonrpc", f"{http_url}/api/v1/check", {200}),
+                ("rest", f"{http_url}/v1/health", {200, 204}),
+            )
+            detected_mode = None
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                for candidate, url, successful_statuses in probes:
+                    try:
+                        response = await client.get(url)
+                    except Exception as exc:
+                        logger.debug("Signal: %s health probe failed: %s", candidate, exc)
+                        continue
+                    if response.status_code in successful_statuses:
+                        detected_mode = candidate
+                        break
+            if not detected_mode:
+                return {"error": f"No supported Signal bridge found at {http_url}"}
+            api_mode = detected_mode
 
         valid_media = media_files or []
         attachment_paths = []
@@ -1819,6 +1843,24 @@ async def _send_signal(extra, chat_id, message, media_files=None):
         plain_text, text_styles = markdown_to_signal(message)
 
         async def _post(batch_attachments, batch_message):
+            timeout = _signal_send_timeout(len(batch_attachments) if batch_attachments else 0)
+            if api_mode == "rest":
+                recipients = [chat_id[6:]] if chat_id.startswith("group:") else [chat_id]
+                rest_payload = {
+                    "number": account,
+                    "recipients": recipients,
+                    "message": batch_message,
+                }
+                if batch_attachments:
+                    rest_payload["base64_attachments"] = [
+                        base64.b64encode(Path(path).read_bytes()).decode("ascii")
+                        for path in batch_attachments
+                    ]
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(f"{http_url}/v2/send", json=rest_payload)
+                    resp.raise_for_status()
+                    return resp.json()
+
             params = {"account": account, "message": batch_message}
             if batch_message and text_styles:
                 if len(text_styles) == 1:
@@ -1838,7 +1880,6 @@ async def _send_signal(extra, chat_id, message, media_files=None):
                 "params": params,
                 "id": f"send_{int(time.time() * 1000)}",
             }
-            timeout = _signal_send_timeout(len(batch_attachments) if batch_attachments else 0)
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(f"{http_url}/api/v1/rpc", json=payload)
                 resp.raise_for_status()
@@ -1846,6 +1887,12 @@ async def _send_signal(extra, chat_id, message, media_files=None):
 
         async def _send_inline_notice(text: str) -> None:
             """Best-effort one-shot RPC for a user-facing pacing notice."""
+            if api_mode == "rest":
+                try:
+                    await _post([], text)
+                except Exception as _e:
+                    logger.warning("Signal: inline notice failed: %s", _e)
+                return
             notice_params = {"account": account, "message": text}
             if chat_id.startswith("group:"):
                 notice_params["groupId"] = chat_id[6:]

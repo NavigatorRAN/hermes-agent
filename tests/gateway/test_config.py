@@ -278,6 +278,22 @@ class TestGatewayConfigRoundtrip:
 
 
 class TestLoadGatewayConfig:
+    def test_signal_api_mode_is_loaded_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "signal:\n"
+            "  api_mode: rest\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("SIGNAL_HTTP_URL", "http://localhost:8080")
+        monkeypatch.setenv("SIGNAL_ACCOUNT", "+15551234567")
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.SIGNAL].extra["api_mode"] == "rest"
+
     def test_shipped_template_does_not_enable_auto_reset(self, tmp_path, monkeypatch):
         """A fresh install seeded from cli-config.yaml.example must not
         auto-reset sessions.

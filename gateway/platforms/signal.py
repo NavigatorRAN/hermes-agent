@@ -26,9 +26,10 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import httpx
+import websockets
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -288,6 +289,8 @@ class SignalAdapter(BasePlatformAdapter):
         extra = config.extra or {}
         self.http_url = extra.get("http_url", "http://127.0.0.1:8080").rstrip("/")
         self.account = extra.get("account", "")
+        self.configured_api_mode = str(extra.get("api_mode") or "auto").strip().lower()
+        self.api_mode: Optional[str] = None
         self.ignore_stories = extra.get("ignore_stories", True)
 
         # Parse allowlists — group policy is derived from presence of group allowlist
@@ -366,6 +369,33 @@ class SignalAdapter(BasePlatformAdapter):
                      self.http_url, redact_phone(self.account),
                      "enabled" if self.group_allow_from else "disabled")
 
+    async def _detect_api_mode(self) -> Optional[str]:
+        """Identify native signal-cli HTTP or bbernhard REST bridge mode."""
+        if not self.client:
+            return None
+
+        requested = self.configured_api_mode
+        if requested not in {"auto", "jsonrpc", "rest"}:
+            logger.error("Signal: unsupported api_mode=%s", requested)
+            return None
+
+        probes = []
+        if requested in {"auto", "jsonrpc"}:
+            probes.append(("jsonrpc", f"{self.http_url}/api/v1/check", {200}))
+        if requested in {"auto", "rest"}:
+            probes.append(("rest", f"{self.http_url}/v1/health", {200, 204}))
+
+        for mode, url, successful_statuses in probes:
+            try:
+                response = await self.client.get(url, timeout=10.0)
+            except Exception as exc:
+                logger.debug("Signal: %s health probe failed: %s", mode, exc)
+                continue
+            if response.status_code in successful_statuses:
+                return mode
+
+        return None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -389,22 +419,25 @@ class SignalAdapter(BasePlatformAdapter):
         from gateway.platforms._http_client_limits import platform_httpx_limits
         self.client = httpx.AsyncClient(timeout=30.0, limits=platform_httpx_limits())
         try:
-            # Health check — verify signal-cli daemon is reachable
-            try:
-                resp = await self.client.get(f"{self.http_url}/api/v1/check", timeout=10.0)
-                if resp.status_code != 200:
-                    logger.error("Signal: health check failed (status %d)", resp.status_code)
-                    return False
-            except Exception as e:
-                logger.error("Signal: cannot reach signal-cli at %s: %s", self.http_url, e)
+            self.api_mode = await self._detect_api_mode()
+            if not self.api_mode:
+                logger.error(
+                    "Signal: cannot identify a supported bridge at %s",
+                    self.http_url,
+                )
                 return False
 
             self._running = True
             self._last_sse_activity = time.time()
-            self._sse_task = asyncio.create_task(self._sse_listener())
+            listener = (
+                self._rest_ws_listener
+                if self.api_mode == "rest"
+                else self._sse_listener
+            )
+            self._sse_task = asyncio.create_task(listener())
             self._health_monitor_task = asyncio.create_task(self._health_monitor())
 
-            logger.info("Signal: connected to %s", self.http_url)
+            logger.info("Signal: connected to %s (%s mode)", self.http_url, self.api_mode)
             return True
         finally:
             if not self._running:
@@ -448,6 +481,68 @@ class SignalAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # SSE Streaming (inbound messages)
     # ------------------------------------------------------------------
+
+    def _rest_ws_url(self) -> str:
+        """Return the bbernhard bridge receive URL for this account."""
+        parsed = urlsplit(self.http_url)
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        receive_path = f"/v1/receive/{quote(self.account, safe='')}"
+        return urlunsplit((scheme, parsed.netloc, receive_path, "", ""))
+
+    async def _handle_rest_ws_message(self, message: Any) -> None:
+        """Decode one bbernhard WebSocket frame and dispatch its envelope."""
+        if isinstance(message, bytes):
+            try:
+                message = message.decode("utf-8")
+            except UnicodeDecodeError:
+                logger.debug("Signal REST WebSocket: ignoring non-UTF-8 frame")
+                return
+        if not isinstance(message, str):
+            return
+        try:
+            payload = json.loads(message)
+        except json.JSONDecodeError:
+            logger.debug("Signal REST WebSocket: invalid JSON: %s", message[:100])
+            return
+        if not isinstance(payload, dict) or "error" in payload:
+            return
+        await self._handle_envelope(payload)
+
+    async def _rest_ws_listener(self) -> None:
+        """Listen to bbernhard signal-cli-rest-api receive events."""
+        url = self._rest_ws_url()
+        backoff = SSE_RETRY_DELAY_INITIAL
+
+        while self._running:
+            try:
+                logger.debug("Signal REST WebSocket: connecting to %s", url)
+                async with websockets.connect(
+                    url,
+                    ping_interval=30,
+                    ping_timeout=60,
+                ) as websocket:
+                    backoff = SSE_RETRY_DELAY_INITIAL
+                    self._last_sse_activity = time.time()
+                    logger.info("Signal REST WebSocket: connected")
+                    async for message in websocket:
+                        if not self._running:
+                            break
+                        self._last_sse_activity = time.time()
+                        await self._handle_rest_ws_message(message)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                if self._running:
+                    logger.warning(
+                        "Signal REST WebSocket: error: %s (reconnecting in %.0fs)",
+                        exc,
+                        backoff,
+                    )
+
+            if self._running:
+                jitter = backoff * 0.2 * random.random()
+                await asyncio.sleep(backoff + jitter)
+                backoff = min(backoff * 2, SSE_RETRY_DELAY_MAX)
 
     async def _sse_listener(self) -> None:
         """Listen for SSE events from signal-cli daemon."""
@@ -518,6 +613,18 @@ class SignalAdapter(BasePlatformAdapter):
     # Health Monitor
     # ------------------------------------------------------------------
 
+    async def _is_bridge_healthy(self) -> bool:
+        if not self.client:
+            return False
+        if self.api_mode == "rest":
+            url = f"{self.http_url}/v1/health"
+            successful_statuses = {200, 204}
+        else:
+            url = f"{self.http_url}/api/v1/check"
+            successful_statuses = {200}
+        response = await self.client.get(url, timeout=10.0)
+        return response.status_code in successful_statuses
+
     async def _health_monitor(self) -> None:
         """Monitor SSE connection health and force reconnect if stale."""
         while self._running:
@@ -529,16 +636,13 @@ class SignalAdapter(BasePlatformAdapter):
             if elapsed > HEALTH_CHECK_STALE_THRESHOLD:
                 logger.warning("Signal: SSE idle for %.0fs, checking daemon health", elapsed)
                 try:
-                    resp = await self.client.get(
-                        f"{self.http_url}/api/v1/check", timeout=10.0
-                    )
-                    if resp.status_code == 200:
+                    if await self._is_bridge_healthy():
                         # Daemon is alive but SSE is idle — update activity to
                         # avoid repeated warnings (connection may just be quiet)
                         self._last_sse_activity = time.time()
                         logger.debug("Signal: daemon healthy, SSE idle")
                     else:
-                        logger.warning("Signal: health check failed (%d), forcing reconnect", resp.status_code)
+                        logger.warning("Signal: health check failed, forcing reconnect")
                         self._force_reconnect()
                 except Exception as e:
                     logger.warning("Signal: health check error: %s, forcing reconnect", e)
@@ -952,6 +1056,80 @@ class SignalAdapter(BasePlatformAdapter):
     # JSON-RPC Communication
     # ------------------------------------------------------------------
 
+    async def _rest_rpc(
+        self,
+        method: str,
+        params: dict,
+        *,
+        timeout: float,
+    ) -> Any:
+        """Translate supported signal-cli calls to the bbernhard REST API."""
+        if not self.client:
+            return None
+
+        recipients = params.get("recipient") or []
+        if isinstance(recipients, str):
+            recipients = [recipients]
+        group_id = params.get("groupId")
+        if group_id:
+            recipients = [group_id]
+
+        account = params.get("account") or self.account
+        if method == "sendTyping":
+            if not recipients:
+                return None
+            url = (
+                f"{self.http_url}/v1/typing-indicator/"
+                f"{quote(account, safe='')}"
+            )
+            request = self.client.delete if params.get("stop") else self.client.put
+            response = await request(
+                url,
+                json={"recipient": recipients[0]},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            return {"success": True}
+
+        if method == "sendReaction":
+            if not recipients:
+                return None
+            url = f"{self.http_url}/v1/reactions/{quote(account, safe='')}"
+            payload: Dict[str, Any] = {
+                "recipient": recipients[0],
+                "target_author": params.get("targetAuthor"),
+                "timestamp": params.get("targetTimestamp"),
+            }
+            if not params.get("remove"):
+                payload["reaction"] = params.get("emoji", "")
+            request = self.client.delete if params.get("remove") else self.client.post
+            response = await request(url, json=payload, timeout=timeout)
+            response.raise_for_status()
+            return {"success": True}
+
+        if method != "send":
+            logger.debug("Signal REST: unsupported compatibility method %s", method)
+            return None
+
+        payload: Dict[str, Any] = {
+            "number": account,
+            "recipients": recipients,
+            "message": params.get("message", ""),
+        }
+        attachment_paths = params.get("attachments") or []
+        if attachment_paths:
+            payload["base64_attachments"] = [
+                base64.b64encode(Path(path).read_bytes()).decode("ascii")
+                for path in attachment_paths
+            ]
+        response = await self.client.post(
+            f"{self.http_url}/v2/send",
+            json=payload,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+
     async def _rpc(
         self,
         method: str,
@@ -978,6 +1156,16 @@ class SignalAdapter(BasePlatformAdapter):
         if not self.client:
             logger.warning("Signal: RPC called but client not connected")
             return None
+
+        if self.api_mode == "rest":
+            try:
+                return await self._rest_rpc(method, params, timeout=timeout)
+            except Exception as e:
+                if log_failures:
+                    logger.warning("Signal REST %s failed: %s", method, e)
+                else:
+                    logger.debug("Signal REST %s failed: %s", method, e)
+                return None
 
         if rpc_id is None:
             rpc_id = f"{method}_{int(time.time() * 1000)}"
