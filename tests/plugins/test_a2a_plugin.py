@@ -41,6 +41,11 @@ def test_exact_signal_send_has_a_non_conversational_rpc_operation():
     assert _method_info("signal/sendExact") == ("signal_send_exact", False)
 
 
+def test_signal_recipient_directory_has_a_non_conversational_rpc_operation():
+    assert _method_info("SignalListRecipients") == ("signal_list_recipients", True)
+    assert _method_info("signal/listRecipients") == ("signal_list_recipients", False)
+
+
 def test_exact_signal_send_fails_closed_without_bridge_configuration(monkeypatch):
     monkeypatch.delenv("SIGNAL_HTTP_URL", raising=False)
     monkeypatch.delenv("SIGNAL_ACCOUNT", raising=False)
@@ -94,6 +99,33 @@ def test_exact_signal_send_dispatches_typed_request_without_agent_turn(monkeypat
     assert captured == request
 
 
+def test_signal_recipient_directory_dispatches_without_agent_turn(monkeypatch):
+    monkeypatch.setenv("SIGNAL_HTTP_URL", "http://signal.test:8080")
+    monkeypatch.setenv("SIGNAL_ACCOUNT", "+61000000000")
+
+    class _ExactService:
+        def list_recipients(self):
+            return [
+                {"alias": "Notes to Self", "displayName": "Notes to Self", "kind": "SELF"}
+            ]
+
+    import plugins.platforms.a2a.adapter as adapter_module
+    monkeypatch.setattr(
+        adapter_module,
+        "_get_signal_exact_service",
+        lambda: _ExactService(),
+        raising=False,
+    )
+
+    response = _bare_adapter()._rpc_signal_list_recipients("req-list")
+
+    assert response["result"] == {
+        "recipients": [
+            {"alias": "Notes to Self", "displayName": "Notes to Self", "kind": "SELF"}
+        ]
+    }
+
+
 def test_agent_card_advertises_exact_signal_contract_only_when_available(monkeypatch):
     import plugins.platforms.a2a.adapter as adapter_module
 
@@ -109,12 +141,21 @@ def test_agent_card_advertises_exact_signal_contract_only_when_available(monkeyp
 
     card = _bare_adapter()._build_card("http://127.0.0.1:9900/")
     skill = next(item for item in card["skills"] if item["id"] == "signal.sendExact")
+    directory = next(
+        item for item in card["skills"] if item["id"] == "signal.listRecipients"
+    )
 
     assert set(skill["tags"]) == {
         "signal_send_exact",
         "exact_body",
         "idempotency_key",
         "delivery_receipt",
+    }
+    assert set(directory["tags"]) == {
+        "signal_list_recipients",
+        "contacts",
+        "notes_to_self",
+        "destination_kind",
     }
 
     class _UnavailableExactService:
@@ -128,6 +169,9 @@ def test_agent_card_advertises_exact_signal_contract_only_when_available(monkeyp
     )
     unavailable_card = _bare_adapter()._build_card("http://127.0.0.1:9900/")
     assert all(item["id"] != "signal.sendExact" for item in unavailable_card["skills"])
+    assert all(
+        item["id"] != "signal.listRecipients" for item in unavailable_card["skills"]
+    )
 
 
 # --------------------------------------------------------------------------

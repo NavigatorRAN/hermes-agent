@@ -23,6 +23,8 @@ class SignalExactError(Exception):
 
 
 class SignalExactService:
+    NOTES_TO_SELF_ALIAS = "Notes to Self"
+
     def __init__(self) -> None:
         self._state_path = get_hermes_home() / "signal-exact-receipts.json"
 
@@ -123,6 +125,37 @@ class SignalExactService:
             self._save_state(state)
         return receipt
 
+    def list_recipients(self) -> list[dict]:
+        """Return unambiguous Signal contacts plus the local self destination."""
+        _, account = self._configuration()
+        aliases: dict[str, tuple[str, set[str]]] = {}
+        for contact in self._fetch_contacts():
+            if not isinstance(contact, dict):
+                continue
+            alias = self._preferred_alias(contact)
+            number = str(contact.get("number") or "").strip()
+            if not alias or not number or number == account:
+                continue
+            key = alias.casefold()
+            if key not in aliases:
+                aliases[key] = (alias, set())
+            aliases[key][1].add(number)
+
+        contacts = [
+            {"alias": alias, "displayName": alias, "kind": "CONTACT"}
+            for alias, numbers in aliases.values()
+            if len(numbers) == 1
+        ]
+        contacts.sort(key=lambda item: item["displayName"].casefold())
+        return [
+            {
+                "alias": self.NOTES_TO_SELF_ALIAS,
+                "displayName": self.NOTES_TO_SELF_ALIAS,
+                "kind": "SELF",
+            },
+            *contacts,
+        ]
+
     @staticmethod
     def _required(request: dict, field: str) -> str:
         value = request.get(field)
@@ -131,6 +164,9 @@ class SignalExactService:
         return value.strip() if field != "body" else value
 
     def _resolve_contact(self, alias: str) -> str:
+        if alias.strip().casefold() == self.NOTES_TO_SELF_ALIAS.casefold():
+            _, account = self._configuration()
+            return account
         matches: set[str] = set()
         normalized = alias.strip().casefold()
         for contact in self._fetch_contacts():
@@ -158,6 +194,21 @@ class SignalExactService:
         if len(matches) != 1:
             raise SignalExactError(f"Signal contact {alias!r} is ambiguous")
         return next(iter(matches))
+
+    @staticmethod
+    def _preferred_alias(contact: dict) -> str:
+        for key in ("name", "profile_name", "nickname", "username"):
+            value = str(contact.get(key) or "").strip()
+            if value:
+                return value
+        return " ".join(
+            part
+            for part in (
+                str(contact.get("given_name") or "").strip(),
+                str(contact.get("family_name") or "").strip(),
+            )
+            if part
+        )
 
     def _fetch_contacts(self) -> list[dict]:
         http_url, account = self._configuration()
